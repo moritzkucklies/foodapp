@@ -1,0 +1,262 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Header, Response
+from fastapi.responses import RedirectResponse, HTMLResponse
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+import os, json, uuid, json, pathlib, socket, time
+import redis
+
+# --- Konfiguration ---
+REDIS_URL      = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+UPLOAD_DIR     = pathlib.Path(os.getenv("UPLOAD_DIR", "/home/pi/uploads")).resolve()
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+QUEUE_NAME     = os.getenv("QUEUE_NAME", "jobs")
+MAX_UPLOAD_MB  = int(os.getenv("MAX_UPLOAD_MB", "10"))
+API_KEY        = os.getenv("API_KEY")
+RATE_LIMIT_ENV = int(os.getenv("RATE_LIMIT_PER_MIN", "40"))
+
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+app = FastAPI()
+# CORS simpel (per ENV erweiterbar: CORS_ORIGINS="http://host1,http://host2")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Security ---
+def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+def enforce_upload_limits(
+    content_length: str | None = Header(default=None, alias="content-length"),
+    content_type: str | None  = Header(default=None, alias="content-type"),
+):
+    # Größe grob aus Header prüfen (wenn gesetzt)
+    try:
+        if content_length and int(content_length) > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Payload too large. Max {MAX_UPLOAD_MB} MB")
+    except Exception:
+        pass
+    # Upload muss multipart/form-data sein
+    if content_type and not content_type.lower().startswith("multipart/form-data"):
+        raise HTTPException(status_code=415, detail="Expected multipart/form-data")
+
+# --- Rate Limit (v2) mit IPv6-Normalisierung + Headern ---
+def _rl_normalize_ip(ip: str | None) -> str:
+    if not ip:
+        return "unknown"
+    ip = ip.strip()
+    if ip == '::1':
+        return '127.0.0.1'
+    if ip.startswith('::ffff:'):
+        return ip.split(':')[-1]
+    return ip
+
+def enforce_rate_limit_v2(request: Request, response: Response):
+    limit = RATE_LIMIT_ENV
+    try:
+        ip = _rl_normalize_ip(getattr(getattr(request, "client", None), "host", None))
+        key = f"rl:{ip}"
+        cnt = r.incr(key)
+        if cnt == 1:
+            r.expire(key, 60)
+        remaining = max(0, limit - cnt)
+        try:
+            response.headers["X-RateLimit-Limit"] = str(limit)
+            response.headers["X-RateLimit-Remaining"] = str(remaining)
+        except Exception:
+            pass
+        if cnt > limit:
+            raise HTTPException(status_code=429, detail="Too many requests")
+    except HTTPException:
+        raise
+    except Exception:
+        # Bei Redis-Problemen nie hart blocken
+        pass
+
+# --- Routes ---
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse("/docs")
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/debug/config", include_in_schema=False, dependencies=[Depends(require_api_key)])
+def debug_config():
+    return {
+        "REDIS_URL": REDIS_URL,
+        "UPLOAD_DIR": str(UPLOAD_DIR),
+        "QUEUE_NAME": QUEUE_NAME,
+        "MAX_UPLOAD_MB": MAX_UPLOAD_MB,
+        "api_key_enabled": bool(API_KEY),
+        "RATE_LIMIT_PER_MIN": RATE_LIMIT_ENV,
+    }
+
+@app.get("/v1/status", dependencies=[Depends(require_api_key)])
+def status_endpoint():
+    out = {"host": socket.gethostname(), "time": time.time(), "queue": QUEUE_NAME}
+    try:
+        out["redis_ok"] = bool(r.ping())
+        out["queue_len"] = int(r.llen(QUEUE_NAME))
+    except Exception as e:
+        out["redis_ok"] = False
+        out["error"] = str(e)
+    # aktive Worker via Heartbeat-Keys
+    try:
+        workers = []
+        for key in r.scan_iter("worker:*"):
+            raw = r.get(key)
+            try:
+                workers.append(json.loads(raw))
+            except Exception:
+                workers.append({"key": key, "raw": raw})
+        out["active_workers"] = workers
+        out["active_worker_count"] = len(workers)
+    except Exception as e:
+        out["active_workers_error"] = str(e)
+        out["active_worker_count"] = 0
+    # Queue-Tiefe pro Queue
+    try:
+        out["queue_len_by_queue"] = {QUEUE_NAME: int(r.llen(QUEUE_NAME))}
+    except Exception as e:
+        out["queue_len_by_queue_error"] = str(e)
+    
+    
+    return out
+
+@app.get("/ui", include_in_schema=False, response_class=HTMLResponse)
+def ui_page():
+    return """<!doctype html>
+<html lang="de">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FoodApp – Test UI</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px}
+ .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin:12px 0}
+ code{background:#f4f4f5;padding:2px 6px;border-radius:6px}
+ .muted{color:#6b7280}
+</style>
+<h1>FoodApp – Test UI</h1>
+
+<div class="card">
+  <label>API Key (X-API-Key): <input id="k" type="password" style="width:280px"></label>
+  <div class="muted">wird nur im Browser (localStorage) gespeichert</div>
+</div>
+
+<div class="card">
+  <h3>Status</h3>
+  <button onclick="loadStatus()">Neu laden</button>
+  <div id="st" class="muted">–</div>
+</div>
+
+<div class="card">
+  <h3>Upload</h3>
+  <form id="f" enctype="multipart/form-data">
+    <input type="file" name="image" accept="image/*" required>
+    <button>Hochladen</button>
+  </form>
+  <div id="out" class="muted">–</div>
+</div>
+
+<script>
+const k = document.getElementById('k');
+k.value = localStorage.getItem('x_api_key') || '';
+k.onchange = () => localStorage.setItem('x_api_key', k.value);
+
+async function loadStatus(){
+  const h = k.value ? {'X-API-Key': k.value} : {};
+  const r = await fetch('/v1/status', {headers: h});
+  const j = await r.json();
+  const q = j.queue_len_by_queue ? (j.queue_len_by_queue.jobs ?? Object.values(j.queue_len_by_queue)[0]) : (j.queue_len ?? '?');
+  document.getElementById('st').innerText =
+    'Workers: ' + (j.active_worker_count ?? '?') + ' | Queue: ' + q;
+}
+
+document.getElementById('f').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const h = k.value ? {'X-API-Key': k.value} : {};
+  const r = await fetch('/v1/upload', {method:'POST', headers: h, body: new FormData(e.target)});
+  let txt = '';
+  try { txt = JSON.stringify(await r.json()); } catch(e) { txt = 'Kein JSON'; }
+  const rl = r.headers.get('X-RateLimit-Remaining');
+  document.getElementById('out').innerText = txt + (rl ? ' | RL-Remaining: ' + rl : '');
+});
+</script>
+</body></html>"""
+
+
+
+# <<< EINZIGER gültiger Decorator für /v1/upload >>>
+@app.post(
+    "/v1/upload",
+    dependencies=[
+        Depends(require_api_key),
+        Depends(enforce_upload_limits),
+        Depends(enforce_rate_limit_v2),
+    ],
+)
+async def upload(image: UploadFile = File(...)):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Bitte ein Bild hochladen.")
+
+    # Content-Length kann fehlen; zur Sicherheit nachlesen und limitieren
+    data = await image.read()
+    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"Payload too large. Max {MAX_UPLOAD_MB} MB")
+
+    job_id = str(uuid.uuid4())
+    ext = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/heic": ".heic",
+        "image/heif": ".heif",
+    }.get(image.content_type, ".bin")
+    out_path = (UPLOAD_DIR / f"{job_id}{ext}").as_posix()
+
+    with open(out_path, "wb") as f:
+        f.write(data)
+
+    job = {"job_id": job_id, "path": out_path, "content_type": image.content_type}
+    r.lpush(QUEUE_NAME, json.dumps(job))
+    return {"job_id": job_id}
+
+@app.get("/v1/result/{job_id}", dependencies=[Depends(require_api_key)])
+def result(job_id: str):
+    key = f"result:{job_id}"
+    data = r.get(key)
+    if not data:
+        return {"status": "pending"}
+    try:
+        try:
+            r.expire(key, 86400)
+        except Exception:
+            pass
+        obj = json.loads(data)
+        try:
+            r.expire(key, 86400)
+        except Exception:
+            pass
+        if isinstance(obj, dict) and "status" not in obj:
+            obj.setdefault("job_id", job_id)
+            obj["status"] = "done"
+        return obj
+    except Exception:
+        return {"status": "error", "detail": "Invalid result payload"}
+
+
+from fastapi import HTTPException
+
+@app.get("/ready", include_in_schema=False)
+def ready():
+    try:
+        r.ping()
+        return {"ok": True}
+    except Exception:
+        raise HTTPException(status_code=503, detail="redis not ready")

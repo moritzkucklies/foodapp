@@ -1,0 +1,157 @@
+import os, json, uuid, pathlib, socket, time
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Header
+from fastapi.responses import RedirectResponse, HTMLResponse
+from starlette.middleware.cors import CORSMiddleware
+import redis
+
+# ---- Konfiguration aus Env ----
+REDIS_URL   = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+QUEUE_NAME  = os.getenv("QUEUE_NAME", "jobs")
+UPLOAD_DIR  = pathlib.Path(os.getenv("UPLOAD_DIR", "/home/pi/uploads")).resolve()
+API_KEY     = os.getenv("API_KEY")
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+# ---- Security: simpler API-Key (optional) ----
+def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    if not API_KEY:
+        return  # kein Key gesetzt -> offen
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+# ---- Upload-Limits (Content-Length + Content-Type) ----
+def enforce_upload_limits(
+    content_length: str | None = Header(default=None, alias="content-length"),
+    content_type: str | None  = Header(default=None, alias="content-type"),
+):
+    try:
+        if content_length and int(content_length) > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Payload too large. Max {MAX_UPLOAD_MB} MB")
+    except Exception:
+        # Kein/kaputter Header -> nicht hart blocken
+        pass
+    if content_type and not content_type.lower().startswith("multipart/form-data"):
+        raise HTTPException(status_code=415, detail="Expected multipart/form-data")
+
+# ---- Health offen lassen ----
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# ---- Kleines Upload-Formular ----
+@app.get("/test", response_class=HTMLResponse)
+def test_form():
+    return """
+    <html><body>
+    <h3>Upload-Test</h3>
+    <form action="/v1/upload" method="post" enctype="multipart/form-data">
+      <input type="file" name="image" accept="image/*"/>
+      <button type="submit">Hochladen</button>
+    </form>
+    </body></html>
+    """
+
+# ---- Upload-Endpunkt (geschützt) ----
+@app.post("/v1/upload", dependencies=[Depends(require_api_key), Depends(enforce_upload_limits)])
+async def upload(image: UploadFile = File(...)):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Bitte ein Bild hochladen.")
+
+    job_id = str(uuid.uuid4())
+    ext = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/heic": ".heic",
+        "image/heif": ".heif",
+    }.get(image.content_type, ".bin")
+
+    out_path = (UPLOAD_DIR / f"{job_id}{ext}")
+    data = await image.read()
+    with open(out_path, "wb") as f:
+        f.write(data)
+
+    job = {"job_id": job_id, "path": str(out_path), "content_type": image.content_type}
+    r.lpush(QUEUE_NAME, json.dumps(job))
+    return {"job_id": job_id}
+
+# ---- Ergebnis holen (geschützt) ----
+@app.get("/v1/result/{job_id}", dependencies=[Depends(require_api_key)])
+def result(job_id: str):
+    key = f"result:{job_id}"
+    data = r.get(key)
+    if not data:
+        return {"status": "pending"}
+    try:
+        return json.loads(data)
+    except Exception:
+        return {"status": "error", "detail": "Invalid result payload"}
+
+# ---- Redirect Root -> /docs ----
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse("/docs")
+
+# ---- Debug: aktuelle Config zeigen ----
+@app.get("/debug/config", include_in_schema=False)
+def debug_config():
+    return {
+        "REDIS_URL": REDIS_URL,
+        "UPLOAD_DIR": str(UPLOAD_DIR),
+        "QUEUE_NAME": QUEUE_NAME,
+        "MAX_UPLOAD_MB": MAX_UPLOAD_MB,
+        "api_key_enabled": bool(API_KEY),
+    }
+
+# ---- Status: Redis & Queue ----
+@app.get("/v1/status")
+def status_endpoint():
+    out = {
+        "host": socket.gethostname(),
+        "time": time.time(),
+        "queue": QUEUE_NAME,
+    }
+    try:
+        out["redis_ok"] = bool(r.ping())
+        out["queue_len"] = int(r.llen(QUEUE_NAME))
+    except Exception as e:
+        out["redis_ok"] = False
+        out["error"] = str(e)
+    return out
+
+# ---- Simple Test UI (HTML, optional hübsch) ----
+@app.get("/ui", include_in_schema=False, response_class=HTMLResponse)
+def ui_page():
+    return """<!doctype html>
+<html lang="de">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FoodApp – Test UI</title>
+<style>
+  :root{--bg:#0b132b;--panel:#1c2541;--accent:#5bc0be;--text:#e0e6f0;--muted:#9fb3c8;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  .wrap{max-width:960px;margin:32px auto;padding:0 16px}
+  .card{background:var(--panel);border-radius:14px;padding:18px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+  h1{font-weight:700;font-size:22px;margin:8px 0 16px}
+  label{display:block;margin:8px 0;color:var(--muted)}
+  button{background:var(--accent);color:#042a2b;border:0;border-radius:10px;padding:10px 16px;font-weight:700;cursor:pointer}
+</style>
+<div class="wrap">
+  <div class="card">
+    <h1>FoodApp – Upload</h1>
+    <form action="/v1/upload" method="post" enctype="multipart/form-data">
+      <label>Datei: <input type="file" name="image" accept="image/*"/></label>
+      <button type="submit">Hochladen</button>
+    </form>
+  </div>
+</div>
+</html>"""

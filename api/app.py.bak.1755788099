@@ -1,0 +1,297 @@
+from starlette.requests import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi import Depends, HTTPException, status, Header
+from fastapi.responses import RedirectResponse
+import os, uuid, json, pathlib
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse
+from starlette.middleware.cors import CORSMiddleware
+import redis
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+UPLOAD_DIR = pathlib.Path(os.getenv("UPLOAD_DIR", "/home/pi/uploads")).resolve()
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/test", response_class=HTMLResponse)
+def test_form():
+    return """
+    <html><body>
+    <h3>Upload-Test</h3>
+    <form action="/v1/upload" method="post" enctype="multipart/form-data">
+      <input type="file" name="image" accept="image/*"/>
+      <button type="submit">Hochladen</button>
+    </form>
+    </body></html>
+    """
+
+@app.post("/v1/upload", dependencies=[Depends(require_api_key)])
+async def upload(image: UploadFile = File(...)):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Bitte ein Bild hochladen.")
+
+    job_id = str(uuid.uuid4())
+    ext = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/heic": ".heic",
+        "image/heif": ".heif",
+    }.get(image.content_type, ".bin")
+
+    out_path = (UPLOAD_DIR / f"{job_id}{ext}").as_posix()
+
+    data = await image.read()
+    with open(out_path, "wb") as f:
+        f.write(data)
+
+    job = {"job_id": job_id, "path": out_path, "content_type": image.content_type}
+    r.lpush("jobs", json.dumps(job))
+
+    return {"job_id": job_id}
+
+@app.get("/v1/result/{job_id}", dependencies=[Depends(require_api_key)])
+def result(job_id: str):
+    key = f"result:{job_id}"
+    data = r.get(key)
+    if not data:
+        return {"status": "pending"}
+    try:
+        return json.loads(data)
+    except Exception:
+        return {"status": "error", "detail": "Invalid result payload"}
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse("/docs")
+from fastapi.responses import RedirectResponse
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse("/docs")
+
+@app.get("/debug/config", include_in_schema=False)
+def debug_config():
+    import os
+    return {
+        "REDIS_URL": os.getenv("REDIS_URL"),
+        "UPLOAD_DIR": os.getenv("UPLOAD_DIR"),
+        "QUEUE_NAME": os.getenv("QUEUE_NAME", "jobs")
+    }
+
+@app.get("/v1/status")
+def status():
+    import os, socket, time
+    import redis
+    out = {
+        "host": socket.gethostname(),
+        "time": time.time(),
+        "queue": os.getenv("QUEUE_NAME", "jobs"),
+    }
+    url = os.getenv("REDIS_URL")
+    try:
+        r = redis.from_url(url, decode_responses=True, socket_connect_timeout=0.5, socket_timeout=0.5)
+        out["redis_ok"] = bool(r.ping())
+        out["queue_len"] = int(r.llen(out["queue"]))
+    except Exception as e:
+        out["redis_ok"] = False
+        out["error"] = str(e)
+    return out
+
+# ---- Simple Test UI (HTML) ----
+from fastapi.responses import HTMLResponse
+
+@app.get("/ui", include_in_schema=False, response_class=HTMLResponse)
+def ui_page():
+    return """<!doctype html>
+<html lang="de">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FoodApp – Test UI</title>
+<style>
+  :root{--bg:#0b132b;--panel:#1c2541;--accent:#5bc0be;--text:#e0e6f0;--muted:#9fb3c8;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  .wrap{max-width:960px;margin:32px auto;padding:0 16px}
+  .card{background:var(--panel);border-radius:14px;padding:18px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+  h1{font-weight:700;font-size:22px;margin:8px 0 16px}
+  label{display:block;margin-bottom:8px;color:var(--muted);font-size:14px}
+  input[type=file]{display:block;margin-bottom:12px}
+  button{background:var(--accent);color:#042a2b;border:0;border-radius:10px;padding:10px 16px;font-weight:700;cursor:pointer}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .row{display:grid;gap:16px;grid-template-columns:1fr}
+  @media(min-width:860px){.row{grid-template-columns:1fr 1fr}}
+  .muted{color:var(--muted);font-size:13px}
+  pre{white-space:pre-wrap;background:#0f1a36;border-radius:10px;padding:12px;overflow:auto}
+  img.preview{max-width:100%;border-radius:10px;display:block}
+  .pill{display:inline-block;background:#0f1a36;padding:4px 10px;border-radius:999px;font-size:12px;margin-right:8px}
+</style>
+<div class="wrap">
+  <div class="card">
+    <h1>FoodApp – Hailo Test UI</h1>
+    <div class="muted">Lade ein Bild hoch, wir erzeugen einen Job und pollen das Ergebnis.</div>
+  </div>
+
+  <div class="row" style="margin-top:16px">
+    <div class="card">
+      <label>Bild auswählen (JPEG/PNG)</label>
+      <input id="file" type="file" accept="image/*">
+      <button id="btn">Analyse starten</button>
+      <div id="status" class="muted" style="margin-top:10px"></div>
+      <img id="preview" class="preview" style="display:none;margin-top:12px" />
+    </div>
+
+    <div class="card">
+      <div style="margin-bottom:8px">
+        <span class="pill" id="pill-job">Job: –</span>
+        <span class="pill" id="pill-queue">Queue: –</span>
+        <span class="pill" id="pill-redis">Redis: –</span>
+      </div>
+      <label>Ergebnis</label>
+      <pre id="out">{ }</pre>
+      <details style="margin-top:10px">
+        <summary class="muted">Hailo Log (stdout)</summary>
+        <pre id="hailo">{ }</pre>
+      </details>
+    </div>
+  </div>
+</div>
+
+<script>
+const el = (id)=>document.getElementById(id);
+async function refreshStatus(){
+  try{
+    const r = await fetch('/v1/status');
+    const j = await r.json();
+    el('pill-queue').textContent = 'Queue: ' + (j.queue ?? 'jobs');
+    el('pill-redis').textContent = 'Redis: ' + (j.redis_ok ? 'OK' : 'DOWN') + (j.queue_len!=null?' · '+j.queue_len:'');
+  }catch(e){ el('pill-redis').textContent='Redis: ?'; }
+}
+refreshStatus(); setInterval(refreshStatus, 4000);
+
+function showPreview(file){
+  const img = el('preview');
+  img.src = URL.createObjectURL(file);
+  img.style.display='block';
+}
+
+async function upload(file){
+  const fd = new FormData();
+  fd.append('image', file); // API erwartet Feldname image
+  const res = await fetch('/v1/upload', { method:'POST', body: fd });
+  if(!res.ok) throw new Error('Upload fehlgeschlagen: '+res.status);
+  return res.json();
+}
+
+async function poll(jobId, maxSec=20){
+  const t0 = Date.now();
+  while(true){
+    const r = await fetch('/v1/result/'+jobId);
+    const j = await r.json();
+    if (j.status === 'done' || j.items || j.error){
+      return j;
+    }
+    if ((Date.now()-t0)/1000 > maxSec) return {error:'Timeout', job_id:jobId};
+    await new Promise(r=>setTimeout(r, 1000));
+  }
+}
+
+el('btn').addEventListener('click', async ()=>{
+  const f = el('file').files[0];
+  if(!f){ alert('Bitte ein Bild wählen.'); return; }
+  el('status').textContent = 'Lade hoch…';
+  el('btn').disabled = true;
+  showPreview(f);
+  try{
+    const up = await upload(f);
+    el('pill-job').textContent = 'Job: ' + up.job_id;
+    el('status').textContent = 'Warte auf Ergebnis…';
+    const res = await poll(up.job_id);
+    el('out').textContent = JSON.stringify(res.items ?? res, null, 2);
+    el('hailo').textContent = res.hailo_stdout ? res.hailo_stdout : '(kein Log)';
+    el('status').textContent = res.error ? ('Fehler: '+res.error) : 'Fertig.';
+  }catch(e){
+    el('status').textContent = 'Fehler: ' + e.message;
+  }finally{
+    el('btn').disabled = false;
+    refreshStatus();
+  }
+});
+</script>
+</html>"""
+
+# --- Upload-Schutz per Middleware (Größe & Header) ---
+import os, json, socket, time, redis
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from fastapi import Depends, HTTPException, status, Header
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
+
+class MaxSizeMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path.startswith("/v1/upload"):
+            cl = request.headers.get("content-length")
+            try:
+                if cl and int(cl) > MAX_UPLOAD_MB * 1024 * 1024:
+                    return JSONResponse({"detail": f"Payload too large. Max {MAX_UPLOAD_MB} MB"}, status_code=413)
+            except Exception:
+                pass
+            ct = request.headers.get("content-type","").lower()
+            if not ct.startswith("multipart/form-data"):
+                return JSONResponse({"detail":"Invalid Content-Type"}, status_code=415)
+        return await call_next(request)
+
+# Middleware aktivieren (nur einmal)
+try:
+    app.add_middleware(MaxSizeMiddleware)
+except Exception:
+    pass
+
+# Optionaler API-Key (Header: x-api-key). Aktiv nur, wenn API_KEY gesetzt ist.
+API_KEY = os.getenv("API_KEY", "").strip()
+async def require_api_key(x_api_key: str | None = Header(default=None)):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
+    return True
+
+# Root -> Docs Redirect (idempotent)
+@app.get("/", include_in_schema=False)
+def root():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse("/docs")
+
+# Systemstatus inkl. Worker-Heartbeats
+@app.get("/v1/system")
+def system_status():
+    url = os.getenv("REDIS_URL")
+    q   = os.getenv("QUEUE_NAME","jobs")
+    info = {"redis_ok": False, "queue_len": None, "active_workers": []}
+    try:
+        r = redis.Redis.from_url(url, decode_responses=True, socket_connect_timeout=1, socket_timeout=1)
+        info["queue_len"] = r.llen(q)
+        info["redis_ok"] = True
+        for key in sorted(r.keys("worker:*")):
+            val = r.get(key)
+            try:
+                parsed = json.loads(val) if val else None
+            except Exception:
+                parsed = {"raw": val}
+            info["active_workers"].append({"key": key, "info": parsed})
+    except Exception as e:
+        info["error"] = str(e)
+    info["host"] = socket.gethostname()
+    info["time"] = int(time.time())
+    return info

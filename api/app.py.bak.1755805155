@@ -1,0 +1,180 @@
+from starlette.requests import Request
+from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Header, Response
+from fastapi.responses import RedirectResponse, HTMLResponse
+from starlette.middleware.cors import CORSMiddleware
+import os, uuid, json, pathlib, socket, time
+import redis
+
+# --- Konfiguration ---
+REDIS_URL   = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+UPLOAD_DIR  = pathlib.Path(os.getenv("UPLOAD_DIR", "/home/pi/uploads")).resolve()
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+QUEUE_NAME  = os.getenv("QUEUE_NAME", "jobs")
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
+API_KEY     = os.getenv("API_KEY")
+
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Security ---
+def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+def enforce_upload_limits(
+    content_length: str | None = Header(default=None, alias="content-length"),
+    content_type: str | None  = Header(default=None, alias="content-type"),
+):
+    # Größe grob aus Header prüfen (wenn gesetzt)
+    try:
+        if content_length and int(content_length) > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Payload too large. Max {MAX_UPLOAD_MB} MB")
+    except Exception:
+        pass
+    # Upload muss multipart/form-data sein
+    if content_type and not content_type.lower().startswith("multipart/form-data"):
+        raise HTTPException(status_code=415, detail="Expected multipart/form-data")
+
+# --- Routes ---
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse("/docs")
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/debug/config", include_in_schema=False, dependencies=[Depends(require_api_key)])
+def debug_config():
+    return {
+        "REDIS_URL": REDIS_URL,
+        "UPLOAD_DIR": str(UPLOAD_DIR),
+        "QUEUE_NAME": QUEUE_NAME,
+        "MAX_UPLOAD_MB": MAX_UPLOAD_MB,
+        "api_key_enabled": bool(API_KEY),
+    }
+
+@app.get("/v1/status", dependencies=[Depends(require_api_key)])
+def status_endpoint():
+    out = {"host": socket.gethostname(), "time": time.time(), "queue": QUEUE_NAME}
+    try:
+        out["redis_ok"] = bool(r.ping())
+        out["queue_len"] = int(r.llen(QUEUE_NAME))
+    except Exception as e:
+        out["redis_ok"] = False
+        out["error"] = str(e)
+    return out
+
+@app.get("/test", response_class=HTMLResponse)
+def test_form():
+    return """<html><body>
+    <h3>Upload-Test</h3>
+    <form action="/v1/upload" method="post" enctype="multipart/form-data">
+      <input type="file" name="image" accept="image/*"/>
+      <button type="submit">Hochladen</button>
+    </form>
+    </body></html>"""
+
+
+# --- Rate Limit (pro IP, 60s-Fenster) ---
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "40"))
+def enforce_rate_limit(request: Request):
+
+    # legacy no-op, superseded by v2
+    pass
+
+# --- Rate Limit (v2) mit IPv6-Normalisierung + Headern ---
+def _rl_normalize_ip(ip: str | None) -> str:
+    if not ip:
+        return "unknown"
+    ip = ip.strip()
+    # IPv6 localhost -> IPv4
+    if ip == '::1':
+        return '127.0.0.1'
+    # IPv4-mapped IPv6 -> IPv4
+    if ip.startswith('::ffff:'):
+        return ip.split(':')[-1]
+    return ip
+
+def enforce_rate_limit_v2(request: Request, response: Response):
+    limit = int(os.getenv("RATE_LIMIT_PER_MIN", "40"))
+    try:
+        ip = _rl_normalize_ip(getattr(getattr(request, "client", None), "host", None))
+        key = f"rl:{ip}"
+        cnt = r.incr(key)
+        if cnt == 1:
+            # TTL sicher setzen
+            r.expire(key, 60)
+        # Header für Debug/Clients
+        remaining = max(0, limit - cnt)
+        try:
+            response.headers["X-RateLimit-Limit"] = str(limit)
+            response.headers["X-RateLimit-Remaining"] = str(remaining)
+        except Exception:
+            pass
+        if cnt > limit:
+            raise HTTPException(status_code=429, detail="Too many requests")
+    except HTTPException:
+        raise
+    except Exception:
+        # Fallback: nie hart blocken, wenn Redis o.ä. Probleme macht
+        pass
+
+@app.post("/v1/upload", dependencies=[Depends(require_api_key), Depends(enforce_upload_limits), Depends(enforce_rate_limit_v2)])
+, Depends(enforce_upload_limits), Depends(enforce_rate_limit_v2)]), Depends(enforce_upload_limits), Depends(enforce_rate_limit_v2)])
+async def upload(image: UploadFile = File(...)):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Bitte ein Bild hochladen.")
+
+    job_id = str(uuid.uuid4())
+    ext = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/heic": ".heic",
+        "image/heif": ".heif",
+    }.get(image.content_type, ".bin")
+    out_path = (UPLOAD_DIR / f"{job_id}{ext}").as_posix()
+
+    data = await image.read()
+    with open(out_path, "wb") as f:
+        f.write(data)
+
+    job = {"job_id": job_id, "path": out_path, "content_type": image.content_type}
+    r.lpush(QUEUE_NAME, json.dumps(job))
+    return {"job_id": job_id}
+
+@app.get("/v1/result/{job_id}", dependencies=[Depends(require_api_key)])
+def result(job_id: str):
+    key = f"result:{job_id}"
+    data = r.get(key)
+    if not data:
+        return {"status": "pending"}
+    try:
+        return json.loads(data)
+    except Exception:
+        return {"status": "error", "detail": "Invalid result payload"}
+@app.get("/ui", include_in_schema=False, response_class=HTMLResponse)
+def ui_page():
+    return """<!doctype html>
+<html lang="de">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FoodApp – Test UI</title>
+<body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px">
+  <h1>FoodApp – Test UI</h1>
+  <form action="/v1/upload" method="post" enctype="multipart/form-data" style="margin:16px 0">
+    <input type="file" name="image" accept="image/*" required>
+    <button type="submit">Hochladen</button>
+  </form>
+  <p>Tipp: Falls API-Key aktiv ist, nutze die Swagger-UI (<a href="/docs">/docs</a>), 
+  oder teste per <code>curl -H "X-API-Key: &lt;dein key&gt;"</code>.</p>
+</body></html>"""
