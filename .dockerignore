@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+node_modules
+dist
+build
+.next
+.out
+*.log
+tmp
+.cache

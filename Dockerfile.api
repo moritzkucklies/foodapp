@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# non-root user
+RUN adduser --disabled-password --gecos "" appuser && chown -R appuser /app
+
+# deps
+COPY api/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# app
+COPY api/ /app/
+
+EXPOSE 8080
+
+# Healthcheck (exec form)
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD ["python","-c","import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()"]
+
+USER appuser
+
+# Flask-App-Objekt heißt 'app' in app.py -> app:app
+CMD ["gunicorn","-w","1","-b","0.0.0.0:8080","app:app"]
