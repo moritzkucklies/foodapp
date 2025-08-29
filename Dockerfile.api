@@ -35,4 +35,5 @@ RUN pip install --no-cache-dir -r /tmp/requirements.api.txt
 COPY app.py /app/app.py
 
 # run via ASGI (FastAPI)
+
 CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8080","--workers","1"]
